@@ -1,0 +1,13 @@
+[package]
+name = "mnist-runner"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+mnist-core = { path = "../core" }
+mnist-gpu-metal = { path = "../gpu_metal" }
+clap.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

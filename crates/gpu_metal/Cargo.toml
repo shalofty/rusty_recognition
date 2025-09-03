@@ -1,0 +1,22 @@
+[package]
+name = "mnist-gpu-metal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+mnist-core = { path = "../core" }
+thiserror.workspace = true
+anyhow.workspace = true
+bytemuck.workspace = true
+
+[dependencies.metal]
+version = "0.29"
+features = ["mps"]
+
+[dependencies.objc2]
+version = "0.5"
+
+[dependencies.objc2-metal]
+version = "0.2"
