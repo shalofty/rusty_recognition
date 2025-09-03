@@ -4,9 +4,9 @@ use anyhow::Result;
 use mnist_core::{
     backend::{Backend, CpuBackend},
     tensor::Tensor,
-    nn::{MLP, LeNet, Sgd, Optimizer},
+    nn::{MLP, LeNet, Sgd},
     data::{MnistDataset, MnistAugmentedDataset, LRScheduler},
-    train::{Trainer, Metrics, Callbacks, TrainableModel},
+    train::{Trainer, Metrics, Callbacks},
     profiler::PerformanceProfiler,
 };
 
@@ -61,6 +61,13 @@ enum Commands {
     Eval {
         #[arg(long)]
         ckpt: String,
+    },
+    /// CPU↔GPU parity checks (softmax-xent, im2col)
+    Parity {
+        #[arg(long, default_value_t = 32)]
+        batch: usize,
+        #[arg(long, default_value_t = 10)]
+        classes: usize,
     },
     /// Run tiny CPU baseline sanity checks
     Sanity {
@@ -123,7 +130,7 @@ fn train_cpu_mlp(epochs: usize, batch_size: usize, learning_rate: f32) -> Result
     println!("Initializing CPU backend and MLP model...");
     let backend = CpuBackend;
     let mut model = MLP::new(backend, &[784, 128, 10]);
-    let mut optimizer = Sgd::new(CpuBackend, learning_rate, Some(0.9));
+    let _optimizer = Sgd::new(CpuBackend, learning_rate, Some(0.9));
     
     let trainer = Trainer::new(CpuBackend);
     let mut callbacks = CsvLogger::new();
@@ -210,7 +217,7 @@ fn train_cpu_mlp(epochs: usize, batch_size: usize, learning_rate: f32) -> Result
 fn train_gpu_mlp(epochs: usize, batch_size: usize, learning_rate: f32) -> Result<()> {
     println!("Loading MNIST dataset...");
     let train_data = MnistDataset::load_train()?;
-    let test_data = MnistDataset::load_test()?;
+    let _test_data = MnistDataset::load_test()?;
     
     println!("Initializing Metal backend...");
     let backend = MetalBackend::new()?;
@@ -219,7 +226,7 @@ fn train_gpu_mlp(epochs: usize, batch_size: usize, learning_rate: f32) -> Result
     println!("Creating MLP model on GPU...");
     let mut model = MLP::new(backend.clone(), &[784, 128, 10]);
     
-    let trainer = Trainer::new(backend.clone());
+    let _trainer = Trainer::new(backend.clone());
     let mut callbacks = CsvLogger::new();
     
     println!("Training MLP on GPU for {} epochs...", epochs);
@@ -313,7 +320,7 @@ fn train_gpu_mlp(epochs: usize, batch_size: usize, learning_rate: f32) -> Result
 fn train_gpu_cnn(epochs: usize, batch_size: usize, learning_rate: f32) -> Result<()> {
     println!("Loading MNIST dataset...");
     let train_data = MnistDataset::load_train()?;
-    let test_data = MnistDataset::load_test()?;
+    let _test_data = MnistDataset::load_test()?;
     
     println!("Initializing Metal backend...");
     let backend = MetalBackend::new()?;
@@ -322,7 +329,7 @@ fn train_gpu_cnn(epochs: usize, batch_size: usize, learning_rate: f32) -> Result
     println!("Creating LeNet CNN model on GPU...");
     let mut model = LeNet::new(backend.clone());
     
-    let trainer = Trainer::new(backend.clone());
+    let _trainer = Trainer::new(backend.clone());
     let mut callbacks = CsvLogger::new();
     
     println!("Training LeNet CNN on GPU for {} epochs...", epochs);
@@ -592,6 +599,9 @@ fn main() -> Result<()> {
         Commands::Eval { ckpt } => {
             println!("Model evaluation would load checkpoint: {}", ckpt);
         }
+        Commands::Parity { batch, classes } => {
+            run_parity(batch, classes)?;
+        }
         Commands::Sanity { batch, steps, lr } => {
             run_sanity_cpu_mlp(batch, steps, lr)?;
         }
@@ -681,5 +691,101 @@ fn run_sanity_cpu_mlp(batch_size: usize, steps: usize, lr: f32) -> Result<()> {
     }
 
     println!("Sanity check complete.");
+    Ok(())
+}
+
+fn run_parity(batch: usize, classes: usize) -> Result<()> {
+    use mnist_gpu_metal::MetalBackend;
+
+    println!("Running parity checks: batch={}, classes={}...", batch, classes);
+
+    // Build deterministic logits and labels
+    let mut logits = vec![0.0f32; batch * classes];
+    for b in 0..batch {
+        for c in 0..classes {
+            let idx = b * classes + c;
+            logits[idx] = (0.03 * (idx as f32).sin()) + (0.01 * (c as f32));
+        }
+    }
+    let labels: Vec<u8> = (0..batch).map(|i| (i % classes) as u8).collect();
+
+    // CPU compute
+    let cpu_logits = Tensor::from_host(&CpuBackend, &logits, (batch, classes));
+    let cpu_labels_f32: Vec<f32> = labels.iter().map(|&l| l as f32).collect();
+    let cpu_labels = Tensor::from_host(&CpuBackend, &cpu_labels_f32, (batch, 1));
+    let mut cpu_loss = Tensor::zeros(&CpuBackend, 1, 1);
+    let mut cpu_dy = Tensor::zeros(&CpuBackend, batch, classes);
+    CpuBackend.softmax_xent(
+        &cpu_logits.buf,
+        &cpu_labels.buf,
+        &mut std::sync::Arc::get_mut(&mut cpu_loss.buf).unwrap(),
+        &mut std::sync::Arc::get_mut(&mut cpu_dy.buf).unwrap(),
+        batch,
+        classes,
+    );
+    let cpu_loss_val = cpu_loss.to_host(&CpuBackend)[0];
+    let cpu_dy_host = cpu_dy.to_host(&CpuBackend);
+
+    // GPU compute
+    let gpu = MetalBackend::new()?;
+    let gpu_logits = Tensor::from_host(&gpu, &logits, (batch, classes));
+    let gpu_labels = Tensor::from_host(&gpu, &cpu_labels_f32, (batch, 1));
+    let mut gpu_loss = Tensor::zeros(&gpu, batch, 1); // per-sample losses, averaged in backend
+    let mut gpu_dy = Tensor::zeros(&gpu, batch, classes);
+    gpu.softmax_xent(
+        &gpu_logits.buf,
+        &gpu_labels.buf,
+        &mut std::sync::Arc::get_mut(&mut gpu_loss.buf).unwrap(),
+        &mut std::sync::Arc::get_mut(&mut gpu_dy.buf).unwrap(),
+        batch,
+        classes,
+    );
+    let gpu_loss_val = gpu_loss.to_host(&gpu)[0];
+    let gpu_dy_host = gpu_dy.to_host(&gpu);
+
+    // Compare
+    let loss_diff = (cpu_loss_val - gpu_loss_val).abs();
+    let grad_diff = cpu_dy_host
+        .iter()
+        .zip(gpu_dy_host.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, |acc, x| acc.max(x));
+
+    println!("softmax_xent: loss_cpu={:.6}, loss_gpu={:.6}, |∆|={:.6}", cpu_loss_val, gpu_loss_val, loss_diff);
+    println!("softmax_xent: max|grad_cpu-gpu|={:.8}", grad_diff);
+
+    let ok = loss_diff < 1e-5 && grad_diff < 1e-5;
+    println!("Parity: {}", if ok { "PASS" } else { "FAIL" });
+
+    // im2col tiny check: input 1x1x3x3, k=2, s=1, no pad
+    let input_h = 3usize;
+    let input_w = 3usize;
+    let input: Vec<f32> = (0..(1*1*input_h*input_w)).map(|i| i as f32).collect();
+
+    let cpu_in = Tensor::from_host(&CpuBackend, &input, (1, 1*input_h*input_w));
+    let mut cpu_cols = Tensor::zeros(&CpuBackend, 1*2*2, (input_h-1)*(input_w-1)); // rows, cols
+    CpuBackend.im2col(
+        &cpu_in.buf,
+        &mut std::sync::Arc::get_mut(&mut cpu_cols.buf).unwrap(),
+        (1,1,input_h,input_w), (2,2), (0,0), (1,1), (input_h-1, input_w-1)
+    );
+    let cpu_cols_h = cpu_cols.to_host(&CpuBackend);
+
+    let gpu_in = Tensor::from_host(&gpu, &input, (1, 1*input_h*input_w));
+    let mut gpu_cols = Tensor::zeros(&gpu, 1*2*2, (input_h-1)*(input_w-1));
+    gpu.im2col(
+        &gpu_in.buf,
+        &mut std::sync::Arc::get_mut(&mut gpu_cols.buf).unwrap(),
+        (1,1,input_h,input_w), (2,2), (0,0), (1,1), (input_h-1, input_w-1)
+    );
+    let gpu_cols_h = gpu_cols.to_host(&gpu);
+
+    let im2col_maxdiff = cpu_cols_h
+        .iter()
+        .zip(gpu_cols_h.iter())
+        .map(|(a,b)| (a-b).abs())
+        .fold(0.0f32, |acc, x| acc.max(x));
+    println!("im2col tiny: max|cpu-gpu|={:.8} => {}", im2col_maxdiff, if im2col_maxdiff < 1e-5 { "PASS" } else { "FAIL" });
+
     Ok(())
 }

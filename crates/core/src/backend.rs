@@ -99,12 +99,12 @@ impl Backend for CpuBackend {
             
             // Compute probabilities and loss
             let prob_true_class = dlogits[offset + label] / sum_exp;
-            total_loss -= prob_true_class.ln();
+            total_loss -= (prob_true_class + 1e-7).ln();
             
             // Compute gradients: prob - target
             for c in 0..classes {
                 let prob = dlogits[offset + c] / sum_exp;
-                dlogits[offset + c] = prob - if c == label { 1.0 } else { 0.0 };
+                dlogits[offset + c] = (prob - if c == label { 1.0 } else { 0.0 }) / (batch as f32);
             }
         }
         

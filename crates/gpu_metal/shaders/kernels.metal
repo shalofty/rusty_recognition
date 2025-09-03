@@ -316,7 +316,7 @@ kernel void im2col(
 kernel void maxpool2d_forward(
     device const float* input       [[buffer(0)]], // Input (N, C, H, W)
     device float*       output      [[buffer(1)]], // Output (N, C, H_out, W_out)
-    device uint*        indices     [[buffer(2)]], // Argmax indices for backward
+    device float*       indices     [[buffer(2)]], // Argmax indices as float for backward on host
     constant uint4&     input_dims  [[buffer(3)]], // N, C, H, W
     constant uint2&     kernel_size [[buffer(4)]], // kernel_h, kernel_w
     constant uint2&     stride      [[buffer(5)]], // stride_h, stride_w
@@ -367,7 +367,7 @@ kernel void maxpool2d_forward(
     
     uint output_idx = n * (C * output_h * output_w) + c * (output_h * output_w) + out_y * output_w + out_x;
     output[output_idx] = max_val;
-    indices[output_idx] = max_idx;
+    indices[output_idx] = float(max_idx);
 }
 
 kernel void sgd_step(

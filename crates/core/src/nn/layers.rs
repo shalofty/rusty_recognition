@@ -58,38 +58,46 @@ impl<B: Backend + Clone> Layer<B> for Linear<B> {
         let x = self.last_input.as_ref().expect("Must call forward before backward");
         let (batch_size, in_features) = x.shape;
         let (_, out_features) = dy.shape;
-        
-        // For GPU backends, we'll use specialized gradient kernels
-        // For now, use the generic GEMM approach which works for both CPU and GPU
-        
-        // Compute weight gradients: dW = X^T * dY (transposed multiplication)
-        // This is equivalent to: for each (i,j): dW[i,j] += sum_b(X[b,i] * dY[b,j])
-        self.backend.gemm(
-            &x.buf, &dy.buf, Arc::get_mut(&mut self.dw.buf).unwrap(),
-            in_features, out_features, batch_size,
-            1.0, 1.0, None
-        );
-        
-        // Compute bias gradients: db = sum(dY, axis=0)
-        // Simple sum reduction - could be optimized with dedicated kernel later
-        let dy_host = dy.to_host(&self.backend);
-        let mut db_data = vec![0.0f32; out_features];
-        for b in 0..batch_size {
+
+        // Compute on host to ensure correct transposes without backend flags.
+        let x_h = x.to_host(&self.backend);            // (batch, in)
+        let dy_h = dy.to_host(&self.backend);          // (batch, out)
+        let w_h = self.w.to_host(&self.backend);       // (in, out)
+
+        // dW = X^T * dY  => (in, out)
+        let mut dw_h = vec![0.0f32; in_features * out_features];
+        for i in 0..in_features {
             for j in 0..out_features {
-                db_data[j] += dy_host[b * out_features + j];
+                let mut sum = 0.0f32;
+                for b in 0..batch_size {
+                    sum += x_h[b * in_features + i] * dy_h[b * out_features + j];
+                }
+                dw_h[i * out_features + j] = sum;
             }
         }
-        self.db = Tensor::from_host(&self.backend, &db_data, (1, out_features));
-        
-        // Compute input gradients: dX = dY * W^T  
-        let mut dx = Tensor::zeros(&self.backend, batch_size, in_features);
-        self.backend.gemm(
-            &dy.buf, &self.w.buf, Arc::get_mut(&mut dx.buf).unwrap(),
-            batch_size, in_features, out_features,
-            1.0, 0.0, None
-        );
-        
-        dx
+        self.dw = Tensor::from_host(&self.backend, &dw_h, (in_features, out_features));
+
+        // db = sum_b(dY)  => (1, out)
+        let mut db_h = vec![0.0f32; out_features];
+        for b in 0..batch_size {
+            for j in 0..out_features {
+                db_h[j] += dy_h[b * out_features + j];
+            }
+        }
+        self.db = Tensor::from_host(&self.backend, &db_h, (1, out_features));
+
+        // dX = dY * W^T  => (batch, in)
+        let mut dx_h = vec![0.0f32; batch_size * in_features];
+        for b in 0..batch_size {
+            for i in 0..in_features {
+                let mut sum = 0.0f32;
+                for j in 0..out_features {
+                    sum += dy_h[b * out_features + j] * w_h[i * out_features + j];
+                }
+                dx_h[b * in_features + i] = sum;
+            }
+        }
+        Tensor::from_host(&self.backend, &dx_h, (batch_size, in_features))
     }
     
     fn params(&self) -> Vec<&Tensor<B>> {
